@@ -1,0 +1,41 @@
+- [ ]  Data Learning Tasks
+    - [x]  Create the initial draft for the tasks (project flow)
+    - [x]  Watch FastBI Recording
+    - [x]  Review GenAI Advantage (SKO25) Confluence
+    - [ ]  Get AI IDE
+    - [ ]  Git Repo
+        - [ ]  Python
+        - [ ]  Task list
+    - [ ]  LOE - 24 Hours
+    - [ ]  Reserve More Time - 8 Hours
+    - [ ]  Implementing the tasks
+    - [ ]  Solution Documentation
+    - [ ]  TBD: Data Quality
+- [ ]  Zero Report Lab Tasks
+    - [ ]  Upload file PDF (Signed URL)
+        - [x]  Create an S3 bucket
+        - [ ]  Figure out S3 bucket structure (raw, staged, processed) and folder structure
+            - [x]  First-level folder structure
+            - [ ]  Folder structure for raw
+            - [x]  Folder structure for staging
+            - [ ]  Folder structure for processed
+        - [x]  Create IAM Role for Glue
+        - [ ]  TBD: Create a Lambda to trigger the Glue Job on file upload
+    - [ ]  Configure Glue to ETL the PDF
+        - [ ]  Figure out the Glue schema and catalogs
+        - [ ]  Create Glue database
+        - [ ]  Create Glue tables
+        - [ ]  Create a Glue job
+            - [ ]  Create Python script to extract a PDF file to JSON and Parquet
+                - [x]  PDF input validation
+                - [x]  Extract PDF metadata to JSON file
+                - [ ]  Extract PDF metadata to Parquet + create a Glue/Athena table
+                - [ ]  Extract text per page to JSON
+                    - [ ]  Extract pictures to S3 with links in JSON to keep the context of the image
+                    - [ ]  Store JSON in S3
+                - [ ]  Extract relevant data from JSON and create a cleaned Parquet file
+                    - [ ]  Extract “direct” data from PDF
+                    - [ ]  Extract intent or context data from text
+                    - [ ]  Extract data from an image
+                - [ ]  Store the parquet file in S3
+                - [ ]  TBD: Create/Update Excel file with the relevant values from parquet
