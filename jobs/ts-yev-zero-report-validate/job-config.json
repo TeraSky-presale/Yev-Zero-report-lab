@@ -3,7 +3,7 @@
   "Role": "arn:aws:iam::913524936058:role/ts-yev-glue-role-zero-report",
   "Command": {
     "Name": "glueetl",
-    "ScriptLocation": "script.py",
+    "ScriptLocation": "jobs/ts-yev-zero-report-validate/zero_report_parse.py",
     "PythonVersion": "3"
   },
   "ExecutionProperty": {
