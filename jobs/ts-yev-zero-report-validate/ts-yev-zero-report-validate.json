@@ -1,0 +1,21 @@
+{
+  "name": "ts-yev-zero-report-validate",
+  "description": "Validate PDF & write metadata (pilot-light)",
+  "role": "arn:aws:iam::913524936058:role/ts-yev-glue-role-zero-report",
+  "command": {
+    "name": "pythonshell",
+    "scriptLocation": "s3://ts-yev-zero-report/scripts/zero_report_parse.py",
+    "pythonVersion": "3.9"
+  },
+  "glueVersion": "4.0",
+  "maxRetries": 0,
+  "timeout": 30,
+  "maxCapacity": 0.0625,
+  "defaultArguments": {
+    "--additional-python-modules": "pdfplumber,pdfminer.six,pillow",
+    "--SOURCE_BUCKET": "ts-yev-zero-report",
+    "--SOURCE_KEY": "raw/0a927e9e-02ab-4759-8dff-cc0653ff0cad.pdf",
+    "--OUT_BUCKET": "ts-yev-zero-report",
+    "--STAGING_PREFIX": "staging"
+  }
+}
