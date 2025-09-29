@@ -90,9 +90,9 @@ def extract_structured_data(pdf_bytes: bytes, max_pages: int = 4) -> dict:
             print(f"\n[DEBUG] Scanning Page {page_num + 1}")
             raw_text = pdf.pages[page_num].extract_text() or ""
             for i, raw_line in enumerate(raw_text.split("\n")):
-                print(f"[DEBUG] Raw Line {i}: {repr(raw_line)}")
+                #print(f"[DEBUG] Raw Line {i}: {repr(raw_line)}")
                 line, flipped = clean_text(raw_line), flip_line(clean_text(raw_line))
-                print(f"[DEBUG] Flipped Line {i}: {repr(flipped)}")
+                #print(f"[DEBUG] Flipped Line {i}: {repr(flipped)}")
 
                 for key, labels in field_patterns.items():
                     if key in seen_keys:
@@ -133,6 +133,128 @@ def save_parquet_to_s3(df: pd.DataFrame, bucket: str, key: str):
     buf.seek(0)
     boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=buf.read())
     print(f"[INFO] ✅ Wrote Parquet: s3://{bucket}/{key}")
+    
+# ----------------------------
+# 📌 EXTRACT PARAGRAPH CONTEXT WITH BEDROCK
+# ----------------------------
+
+def extract_target_paragraph(pdf_bytes: bytes, page_num: int = 2) -> str:
+    def normalize(line):
+        line = unicodedata.normalize("NFKC", line)
+        line = re.sub(r"[\u200f\u200e]", "", line)  # remove directionality markers
+        return line.strip()
+
+    target_header_variants = [
+        "לתשומת לב הגוף המממן",
+        "לתשומת לב הגוף המממן:",
+        ":ןמממה ףוגה בל תמושתל",  # reverse, in case needed
+    ]
+
+    paragraph_lines = []
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        page_text = pdf.pages[page_num].extract_text()
+        if not page_text:
+            print(f"[WARN] Page {page_num + 1} text is empty")
+            return ""
+
+        lines = page_text.split("\n")
+        for i, raw in enumerate(lines):
+            norm = normalize(raw)
+            print(f"[PAGE 3 DEBUG] Line {i:02}: {repr(norm)}")
+            if any(target in norm for target in target_header_variants):
+                print(f"[DEBUG] ✓ Found anchor line at index {i}: {repr(norm)}")
+                # Grab lines below the header (until bullet point or empty line)
+                for j in range(i + 1, len(lines)):
+                    next_line = normalize(lines[j])
+                    if next_line.startswith("•") or not next_line:
+                        break
+                    paragraph_lines.append(next_line)
+                break
+
+    paragraph = " ".join(paragraph_lines).strip()
+    print(f"[DEBUG] Extracted paragraph: {paragraph}")
+    return paragraph
+
+
+def ask_bedrock(question: str, context: str) -> str:
+    import boto3, json
+
+    br = boto3.client("bedrock-runtime", region_name="eu-central-1")
+    payload = {
+        "messages": [
+            {"role": "user", "content": f"בהתבסס על ההקשר הבא, {question}\n\nהקשר:\n{context}"}
+        ],
+        "max_tokens": 200,
+        "anthropic_version": "bedrock-2023-05-31"
+    }
+    resp = br.invoke_model(
+        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+        body=json.dumps(payload)
+    )
+    body = json.loads(resp["body"].read())
+    return body["content"][0]["text"].strip()
+
+def get_llm_additions(context: str, model_id: str = "anthropic.claude-3-sonnet-20240229-v1:0", region: str = "eu-central-1") -> dict:
+        """
+        Calls Bedrock Claude model to analyze a Hebrew project context paragraph.
+
+        Returns:
+            dict: {"llm_summary": { ...extracted fields... }} or empty if failed.
+        """
+        if not context.strip():
+            print("[WARN] ❌ Context paragraph not found or empty.")
+            return {}
+
+        try:
+            bedrock_client = boto3.client("bedrock-runtime", region_name=region)
+            print("[INFO] ✅ Bedrock Runtime client created.")
+        except Exception as e:
+            print(f"[WARN] ❌ Failed to create Bedrock client: {e}")
+            return {}
+
+        prompt = f"""\
+    Human: אתה מקבל את הטקסט הבא מתוך מסמך תמיכה בפרויקט בניה.
+    האם תוכל להוציא מתוך הפסקה הזו את כל הנתונים החשובים עבור גוף מממן?
+    נתונים חשובים כוללים: תיאור הפרויקט, שלב, כתובת, סוגי פעולות, היקף כספי, מצב, תאריך, והאם הפרויקט הוא חדש או חיזוק.
+
+    טקסט:
+    \"\"\"{context}\"\"\"
+
+    החזר את התשובה כ-JSON עם מפתחות מתאימים.
+
+    Assistant:"""
+
+        body = {
+            "prompt": prompt,
+            "max_tokens_to_sample": 1024,
+            "temperature": 0.3,
+            "top_k": 250,
+            "top_p": 0.9,
+            "stop_sequences": ["\n\nHuman:"]
+        }
+
+        try:
+            response = bedrock_client.invoke_model(
+                modelId=model_id,
+                body=json.dumps(body),
+                contentType="application/json",
+                accept="application/json"
+            )
+
+            response_body = response["body"].read().decode("utf-8")
+            print(f"[DEBUG] Raw Bedrock response: {response_body}")
+
+            parsed = json.loads(response_body)
+            completion = parsed.get("completion", "{}")
+            result = json.loads(completion)
+
+            print("[INFO] ✅ LLM extraction succeeded")
+            return {"llm_summary": result}
+
+        except Exception as e:
+            print(f"[WARN] ❌ LLM extraction failed: {e}")
+            return {}
 
 # ----------------------------
 # 📌 MAIN ETL FLOW
@@ -147,7 +269,12 @@ def main():
     ap.add_argument("--STAGING_PARQUET_PREFIX", required=True)
     ap.add_argument("--PROCESSED_JSON_PREFIX", required=True)
     ap.add_argument("--PROCESSED_PARQUET_PREFIX", required=True)
+    
+    # Toggle for Bedrock LLM
+    ap.add_argument("--ENABLE_BEDROCK_TEXT", default="false", help="true to enable LLM paragraph analysis")
+    
     args, unknown = ap.parse_known_args()
+    enable_bedrock = args.ENABLE_BEDROCK_TEXT.lower() == "true"
 
     print(f"[DEBUG] ▶ ETL Script v1.0 Started")
     if unknown:
@@ -169,7 +296,7 @@ def main():
         print("[ERROR] Hebrew not detected", file=sys.stderr)
         sys.exit(5)
 
-    # Generate ID + Metadata
+    # Metadata
     doc_id = generate_doc_id(args.SOURCE_BUCKET, args.SOURCE_KEY, head_meta["etag"])
     ingest_date = datetime.date.today().isoformat()
     metadata = extract_metadata(pdf_bytes, args.SOURCE_BUCKET, args.SOURCE_KEY, head_meta)
@@ -179,8 +306,17 @@ def main():
     save_json_to_s3(metadata, args.OUT_BUCKET, f"{args.STAGING_JSON_PREFIX}/ingest_date_partition={ingest_date}/doc_id_partition={doc_id}/metadata.json")
     save_parquet_to_s3(pd.DataFrame([metadata]), args.OUT_BUCKET, f"{args.STAGING_PARQUET_PREFIX}/ingest_date_partition={ingest_date}/doc_id_partition={doc_id}/metadata.parquet")
 
-    # Structured field extraction
+    # Structured data
     structured = extract_structured_data(pdf_bytes)
+
+    # Apply LLM only if toggle is on
+    if enable_bedrock:
+        context_paragraph = extract_target_paragraph(pdf_bytes, page_num=2)  # page_num=2 → page 3
+        structured.update(get_llm_additions(context_paragraph))
+
+
+
+    # Save structured data
     save_json_to_s3(structured, args.OUT_BUCKET, f"{args.PROCESSED_JSON_PREFIX}/ingest_date_partition={ingest_date}/doc_id_partition={doc_id}/data.json")
     save_parquet_to_s3(pd.DataFrame([{**structured, "doc_id": doc_id, "ingest_date": ingest_date}]), args.OUT_BUCKET, f"{args.PROCESSED_PARQUET_PREFIX}/ingest_date_partition={ingest_date}/doc_id_partition={doc_id}/data.parquet")
 
