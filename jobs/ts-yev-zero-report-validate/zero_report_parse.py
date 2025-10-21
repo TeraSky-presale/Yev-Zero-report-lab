@@ -1,4 +1,4 @@
-# zero_report_parse.py — Modularized ETL v1.0
+# zero_report_parse.py — Modularized ETL v1.1 (Titan-only, cleaned)
 
 import argparse, io, json, re, sys, unicodedata, hashlib, datetime
 import boto3
@@ -9,13 +9,10 @@ import pyarrow.parquet as pq
 from io import BytesIO
 
 # ----------------------------
-# 📌 PDF LOADER
+# PDF LOADER
 # ----------------------------
 
 HEBREW_RE = re.compile(r"[\u0590-\u05FF]")
-
-def strip_diacritics(text: str) -> str:
-    return "".join(ch for ch in unicodedata.normalize("NFD", text) if unicodedata.category(ch) != "Mn")
 
 def load_pdf_bytes(bucket: str, key: str):
     s3 = boto3.client("s3")
@@ -37,7 +34,7 @@ def generate_doc_id(bucket: str, key: str, etag: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 # ----------------------------
-# 📌 TEXT & METADATA ANALYSIS
+# TEXT & METADATA ANALYSIS
 # ----------------------------
 
 def extract_text_sample(pdf_bytes: bytes, max_pages: int = 10):
@@ -66,7 +63,7 @@ def extract_metadata(pdf_bytes: bytes, bucket: str, key: str, head_meta: dict) -
         return normalized
 
 # ----------------------------
-# 📌 STRUCTURED FIELD EXTRACTION
+# STRUCTURED FIELD EXTRACTION
 # ----------------------------
 
 def extract_structured_data(pdf_bytes: bytes, max_pages: int = 4) -> dict:
@@ -89,24 +86,20 @@ def extract_structured_data(pdf_bytes: bytes, max_pages: int = 4) -> dict:
         for page_num in range(min(len(pdf.pages), max_pages)):
             print(f"\n[DEBUG] Scanning Page {page_num + 1}")
             raw_text = pdf.pages[page_num].extract_text() or ""
-            for i, raw_line in enumerate(raw_text.split("\n")):
-                #print(f"[DEBUG] Raw Line {i}: {repr(raw_line)}")
+            for raw_line in raw_text.split("\n"):
                 line, flipped = clean_text(raw_line), flip_line(clean_text(raw_line))
-                #print(f"[DEBUG] Flipped Line {i}: {repr(flipped)}")
-
                 for key, labels in field_patterns.items():
                     if key in seen_keys:
                         continue
                     for label in labels:
-                        # Try both directions
                         fwd_pat = rf"{label}\s*[:\-]?\s*(.+)"
                         rev_pat = rf"(.+)\s*[:\-]?\s*{label}"
-                        for pat in [fwd_pat, rev_pat]:
+                        for pat in (fwd_pat, rev_pat):
                             match = re.search(pat, line) or re.search(pat, flipped)
                             if match:
                                 val = match.group(1).strip().strip(".")
                                 if re.search(pat, flipped):
-                                    val = val[::-1]  # Unflip value only
+                                    val = val[::-1]  # unflip value only
                                 extracted[key] = val
                                 seen_keys.add(key)
                                 print(f"[DEBUG] ✓ Matched {key}: {val}")
@@ -114,7 +107,7 @@ def extract_structured_data(pdf_bytes: bytes, max_pages: int = 4) -> dict:
     return extracted
 
 # ----------------------------
-# 📌 S3 OUTPUT HANDLERS
+# S3 OUTPUT HANDLERS
 # ----------------------------
 
 def save_json_to_s3(obj: dict, bucket: str, key: str):
@@ -129,135 +122,177 @@ def save_json_to_s3(obj: dict, bucket: str, key: str):
 def save_parquet_to_s3(df: pd.DataFrame, bucket: str, key: str):
     table = pa.Table.from_pandas(df)
     buf = BytesIO()
-    pq.write_table(table, buf, compression='snappy')
+    pq.write_table(table, buf, compression="snappy")
     buf.seek(0)
     boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=buf.read())
     print(f"[INFO] ✅ Wrote Parquet: s3://{bucket}/{key}")
-    
+
 # ----------------------------
-# 📌 EXTRACT PARAGRAPH CONTEXT WITH BEDROCK
+# LLM CONTEXT (PARAGRAPH) + TITAN CALL
 # ----------------------------
 
 def extract_target_paragraph(pdf_bytes: bytes, page_num: int = 2) -> str:
-    def normalize(line):
+    """Grab the block immediately after 'לתשומת לב הגוף המממן', including bullet lines."""
+    def normalize(line: str) -> str:
         line = unicodedata.normalize("NFKC", line)
-        line = re.sub(r"[\u200f\u200e]", "", line)  # remove directionality markers
+        line = re.sub(r"[\u200f\u200e]", "", line)
         return line.strip()
 
-    target_header_variants = [
+    anchors = [
         "לתשומת לב הגוף המממן",
         "לתשומת לב הגוף המממן:",
-        ":ןמממה ףוגה בל תמושתל",  # reverse, in case needed
+        ":ןמממה ףוגה בל תמושתל",
     ]
 
-    paragraph_lines = []
-
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        page_text = pdf.pages[page_num].extract_text()
-        if not page_text:
-            print(f"[WARN] Page {page_num + 1} text is empty")
-            return ""
-
+        page_text = pdf.pages[page_num].extract_text() or ""
         lines = page_text.split("\n")
+
         for i, raw in enumerate(lines):
             norm = normalize(raw)
-            print(f"[PAGE 3 DEBUG] Line {i:02}: {repr(norm)}")
-            if any(target in norm for target in target_header_variants):
-                print(f"[DEBUG] ✓ Found anchor line at index {i}: {repr(norm)}")
-                # Grab lines below the header (until bullet point or empty line)
-                for j in range(i + 1, len(lines)):
-                    next_line = normalize(lines[j])
-                    if next_line.startswith("•") or not next_line:
+            if any(a in norm for a in anchors):
+                block = []
+                # collect up to the next blank line OR up to 12 lines (sane cap)
+                for j in range(i + 1, min(i + 1 + 12, len(lines))):
+                    nxt = normalize(lines[j])
+                    if not nxt:
                         break
-                    paragraph_lines.append(next_line)
-                break
+                    # Keep bullets but strip the symbol
+                    nxt = nxt.lstrip("•").strip()
+                    block.append(nxt)
+                paragraph = " ".join(block)
+                print(f"[DEBUG] Extracted paragraph: {paragraph}")
+                return paragraph
 
-    paragraph = " ".join(paragraph_lines).strip()
-    print(f"[DEBUG] Extracted paragraph: {paragraph}")
-    return paragraph
+    print("[WARN] No context paragraph found under the anchor.")
+    return ""
 
 
-def ask_bedrock(question: str, context: str) -> str:
-    import boto3, json
-
-    br = boto3.client("bedrock-runtime", region_name="eu-central-1")
-    payload = {
-        "messages": [
-            {"role": "user", "content": f"בהתבסס על ההקשר הבא, {question}\n\nהקשר:\n{context}"}
-        ],
-        "max_tokens": 200,
-        "anthropic_version": "bedrock-2023-05-31"
+def ask_bedrock_titan(prompt: str, region: str = "eu-central-1", model_id: str = "amazon.titan-text-express-v1") -> str:
+    """Calls Amazon Titan Text Express with a plain prompt and returns outputText."""
+    br = boto3.client("bedrock-runtime", region_name=region)
+    body = {
+        "inputText": prompt,
+        "textGenerationConfig": {
+            "maxTokenCount": 400,
+            "temperature": 0.2,
+            "topP": 0.9,
+            "stopSequences": []
+        }
     }
     resp = br.invoke_model(
-        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
-        body=json.dumps(payload)
+        modelId=model_id,
+        body=json.dumps(body),
+        contentType="application/json",
+        accept="application/json"
     )
-    body = json.loads(resp["body"].read())
-    return body["content"][0]["text"].strip()
+    payload = json.loads(resp["body"].read().decode("utf-8"))
+    return (payload.get("results") or [{}])[0].get("outputText", "").strip()
 
-def get_llm_additions(context: str, model_id: str = "anthropic.claude-3-sonnet-20240229-v1:0", region: str = "eu-central-1") -> dict:
-        """
-        Calls Bedrock Claude model to analyze a Hebrew project context paragraph.
+def _hebrew_word_to_int(word: str) -> int:
+    m = {
+        "אחת": 1, "אחד": 1,
+        "שתיים": 2, "שתי": 2, "שניים": 2, "שני": 2,
+        "שלוש": 3, "שלושה": 3,
+        "ארבע": 4, "ארבעה": 4,
+        "חמש": 5, "חמישה": 5,
+        "שש": 6, "שישה": 6,
+        "שבע": 7, "שבעה": 7,
+        "שמונה": 8, "שמונהְ": 8,
+        "תשע": 9, "תשעה": 9,
+        "עשר": 10, "עשרה": 10,
+        "אחת עשרה": 11, "אחד עשר": 11,
+        "שתים עשרה": 12, "שנים עשר": 12,
+    }
+    return m.get(word.strip(), 0)
 
-        Returns:
-            dict: {"llm_summary": { ...extracted fields... }} or empty if failed.
-        """
-        if not context.strip():
-            print("[WARN] ❌ Context paragraph not found or empty.")
-            return {}
+def _extract_numbers_fallback(text: str) -> dict:
+    """
+    Pull floors/units from Hebrew text via regex heuristics.
+    Looks for digits or words near קומ(ה|ות) and יח\"ד/יחידות דיור.
+    """
+    floors = 0
+    units = 0
 
+    # Floors: numeric
+    m = re.search(r"(?:תוספת|הוספת)?\s*(\d+)\s*(?:קומות?|קומה)", text)
+    if m:
+        floors = int(m.group(1))
+
+    # Floors: Hebrew word (e.g., 'קומה אחת', 'שלוש קומות')
+    if floors == 0:
+        m = re.search(r"(?:תוספת|הוספת)?\s*([א-ת ]+?)\s*(?:קומה|קומות)", text)
+        if m:
+            floors = _hebrew_word_to_int(m.group(1))
+
+    # Units: numeric
+    m = re.search(r"(\d+)\s*(?:יח\"?ד|יחידות\s*דיור)", text)
+    if m:
+        units = int(m.group(1))
+
+    return {"new_floors_count": floors, "new_residential_units": units}
+
+
+def get_llm_additions_titan(context: str, region: str = "eu-central-1") -> dict:
+    """Extracts structured 'project additions' from context using Titan and returns a compact JSON-ready dict."""
+    if not context or not context.strip():
+        print("[WARN] ❌ Context paragraph not found or empty.")
+        return {}
+
+    prompt = (
+        "אתה מקבל פסקה ממסמך פרויקט בנייה. החזר אך ורק JSON תקין (ללא טקסט מסביב), עם המפתחות הבאים:\n"
+        "new_floors_count (int), new_residential_units (int), additions_list_he (array of strings), summary_he (string קצר בעברית).\n"
+        "נתמקד רק במה יתווסף לבניין (קומות/יח\"ד/מרפסות/ממ\"דים/שיפוץ/חיזוק). אם לא ידוע מספרים, החזר 0.\n\n"
+        "פסקה:\n"
+        f"\"\"\"{context}\"\"\""
+    )
+
+    try:
+        raw = ask_bedrock_titan(prompt, region=region)  # uses Titan Text Express
+        # Try strict JSON parse first
         try:
-            bedrock_client = boto3.client("bedrock-runtime", region_name=region)
-            print("[INFO] ✅ Bedrock Runtime client created.")
-        except Exception as e:
-            print(f"[WARN] ❌ Failed to create Bedrock client: {e}")
-            return {}
+            obj = json.loads(raw)
+        except Exception:
+            # Fallback: extract a JSON block if the model wrapped it in prose
+            m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+            obj = json.loads(m.group(0)) if m else {}
 
-        prompt = f"""\
-    Human: אתה מקבל את הטקסט הבא מתוך מסמך תמיכה בפרויקט בניה.
-    האם תוכל להוציא מתוך הפסקה הזו את כל הנתונים החשובים עבור גוף מממן?
-    נתונים חשובים כוללים: תיאור הפרויקט, שלב, כתובת, סוגי פעולות, היקף כספי, מצב, תאריך, והאם הפרויקט הוא חדש או חיזוק.
+        if not isinstance(obj, dict):
+            obj = {}
 
-    טקסט:
-    \"\"\"{context}\"\"\"
-
-    החזר את התשובה כ-JSON עם מפתחות מתאימים.
-
-    Assistant:"""
-
-        body = {
-            "prompt": prompt,
-            "max_tokens_to_sample": 1024,
-            "temperature": 0.3,
-            "top_k": 250,
-            "top_p": 0.9,
-            "stop_sequences": ["\n\nHuman:"]
+        # Normalize + defaults
+        result = {
+            "new_floors_count": int(obj.get("new_floors_count", 0) or 0),
+            "new_residential_units": int(obj.get("new_residential_units", 0) or 0),
+            "additions_list_he": obj.get("additions_list_he") or [],
+            "summary_he": (obj.get("summary_he") or "").strip()
         }
 
-        try:
-            response = bedrock_client.invoke_model(
-                modelId=model_id,
-                body=json.dumps(body),
-                contentType="application/json",
-                accept="application/json"
-            )
+        # Compose final fields you store
+        out = {
+            "llm_project_additions_model": "amazon.titan-text-express-v1",
+            "llm_project_additions_he": result["summary_he"],
+            "llm_additions": result
+        }
 
-            response_body = response["body"].read().decode("utf-8")
-            print(f"[DEBUG] Raw Bedrock response: {response_body}")
+        # Fallback: if the model didn't provide numbers, try to lift them from text deterministically.
+        if (out["llm_additions"].get("new_floors_count", 0) == 0 or
+            out["llm_additions"].get("new_residential_units", 0) == 0):
+            fallback = _extract_numbers_fallback(context)
+            if out["llm_additions"].get("new_floors_count", 0) == 0 and fallback["new_floors_count"]:
+                out["llm_additions"]["new_floors_count"] = fallback["new_floors_count"]
+            if out["llm_additions"].get("new_residential_units", 0) == 0 and fallback["new_residential_units"]:
+                out["llm_additions"]["new_residential_units"] = fallback["new_residential_units"]
 
-            parsed = json.loads(response_body)
-            completion = parsed.get("completion", "{}")
-            result = json.loads(completion)
+        print(f"[INFO] ✅ Titan structured: {json.dumps(out['llm_additions'], ensure_ascii=False)}")
+        return out
 
-            print("[INFO] ✅ LLM extraction succeeded")
-            return {"llm_summary": result}
-
-        except Exception as e:
-            print(f"[WARN] ❌ LLM extraction failed: {e}")
-            return {}
+    except Exception as e:
+        print(f"[WARN] ❌ LLM extraction failed (Titan): {e}")
+        return {}
 
 # ----------------------------
-# 📌 MAIN ETL FLOW
+# MAIN ETL FLOW
 # ----------------------------
 
 def main():
@@ -269,14 +304,12 @@ def main():
     ap.add_argument("--STAGING_PARQUET_PREFIX", required=True)
     ap.add_argument("--PROCESSED_JSON_PREFIX", required=True)
     ap.add_argument("--PROCESSED_PARQUET_PREFIX", required=True)
-    
-    # Toggle for Bedrock LLM
     ap.add_argument("--ENABLE_BEDROCK_TEXT", default="false", help="true to enable LLM paragraph analysis")
-    
+
     args, unknown = ap.parse_known_args()
     enable_bedrock = args.ENABLE_BEDROCK_TEXT.lower() == "true"
 
-    print(f"[DEBUG] ▶ ETL Script v1.0 Started")
+    print("[DEBUG] ▶ ETL Script v1.1 Started")
     if unknown:
         print(f"[DEBUG] Ignored Glue args: {unknown}")
 
@@ -309,16 +342,18 @@ def main():
     # Structured data
     structured = extract_structured_data(pdf_bytes)
 
-    # Apply LLM only if toggle is on
+    # Optional LLM enrichment
     if enable_bedrock:
-        context_paragraph = extract_target_paragraph(pdf_bytes, page_num=2)  # page_num=2 → page 3
-        structured.update(get_llm_additions(context_paragraph))
-
-
+        context_paragraph = extract_target_paragraph(pdf_bytes, page_num=2)  # page 3
+        structured.update(get_llm_additions_titan(context_paragraph))
 
     # Save structured data
     save_json_to_s3(structured, args.OUT_BUCKET, f"{args.PROCESSED_JSON_PREFIX}/ingest_date_partition={ingest_date}/doc_id_partition={doc_id}/data.json")
-    save_parquet_to_s3(pd.DataFrame([{**structured, "doc_id": doc_id, "ingest_date": ingest_date}]), args.OUT_BUCKET, f"{args.PROCESSED_PARQUET_PREFIX}/ingest_date_partition={ingest_date}/doc_id_partition={doc_id}/data.parquet")
+    save_parquet_to_s3(
+        pd.DataFrame([{**structured, "doc_id": doc_id, "ingest_date": ingest_date}]),
+        args.OUT_BUCKET,
+        f"{args.PROCESSED_PARQUET_PREFIX}/ingest_date_partition={ingest_date}/doc_id_partition={doc_id}/data.parquet"
+    )
 
     print(json.dumps({
         "status": "OK",
